@@ -228,7 +228,7 @@ def get_sleep_data(garmin_client, date_str):
     return data
 
 def get_workouts(garmin_client):
-    """Get recent workouts"""
+    """Get recent workouts with correct timestamps"""
 
     workouts = []
 
@@ -236,6 +236,20 @@ def get_workouts(garmin_client):
         activities = garmin_client.get_activities(0, 20)  # Last 20 workouts
 
         for activity in activities[:10]:  # Return last 10
+            # 获取startTimeGMT并转换为时间戳
+            start_time_gmt = activity.get('startTimeGMT', None)
+            timestamp = 0
+            date_str = ''
+
+            if start_time_gmt:
+                try:
+                    # startTimeGMT是ISO 8601格式字符串，如 "2026-03-12 12:46:47"
+                    dt = datetime.fromisoformat(start_time_gmt.replace('Z', '+00:00'))
+                    timestamp = int(dt.timestamp())
+                    date_str = dt.strftime('%Y-%m-%d')
+                except Exception as e:
+                    print(f"⚠️  Failed to parse startTimeGMT: {e}", file=sys.stderr)
+
             workout = {
                 'type': activity.get('activityType', 'Unknown'),
                 'name': activity.get('activityName', 'Unnamed'),
@@ -244,7 +258,8 @@ def get_workouts(garmin_client):
                 'calories': activity.get('calories', 0),
                 'heart_rate_avg': activity.get('avgHeartRate', 0),
                 'heart_rate_max': activity.get('maxHeartRate', 0),
-                'timestamp': activity.get('startTimeInSeconds', 0),
+                'timestamp': timestamp,  # 正确的Unix时间戳
+                'date': date_str,  # 日期字符串 (YYYY-MM-DD)
             }
             workouts.append(workout)
 
@@ -477,21 +492,55 @@ def sync_all(output_file=None):
     if not garmin_client:
         return None
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    from datetime import timedelta, timezone
+
+    # 获取北京时间（UTC+8）
+    beijing_tz = timezone(timedelta(hours=8))
+    now_beijing = datetime.now(beijing_tz)
+    hour = now_beijing.hour
+
+    # 智能日期选择：如果现在是0-5点，视为前一天
+    if hour < 5:
+        target_date = (now_beijing - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        target_date = now_beijing.strftime("%Y-%m-%d")
+
+    # 先获取运动记录（用于推断实际数据日期）
+    workouts = get_workouts(garmin_client)
+
+    # 根据最新运动记录的日期推断实际数据日期
+    actual_date = target_date  # 默认使用目标日期
+
+    if workouts and len(workouts) > 0:
+        # 找到最新的有日期的运动记录
+        for workout in workouts:
+            if 'date' in workout and workout['date']:
+                workout_date = workout['date']
+                # 如果运动日期与目标日期相差不超过1天，使用运动日期
+                workout_dt = datetime.strptime(workout_date, '%Y-%m-%d')
+                target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+                diff = abs((workout_dt - target_dt).days)
+
+                if diff <= 1:
+                    actual_date = workout_date
+                    break
+
+    # 获取实际日期的数据
+    summary = get_daily_summary(garmin_client, actual_date)
 
     # Collect all data
     all_data = {
         'timestamp': datetime.now().isoformat(),
-        'date': today,
-        'summary': get_daily_summary(garmin_client, today),
-        'sleep': get_sleep_data(garmin_client, today),
-        'workouts': get_workouts(garmin_client),
-        'vo2_max': get_vo2_max(garmin_client, today),
-        'body_battery': get_body_battery(garmin_client, today),
-        'stress': get_stress_data(garmin_client, today),
-        'hrv': get_hrv_data(garmin_client, today),
-        'fitness_age': get_fitness_age(garmin_client, today),
-        'respiration': get_respiration_data(garmin_client, today),
+        'date': actual_date,  # 使用运动记录的实际日期
+        'summary': summary,
+        'sleep': get_sleep_data(garmin_client, actual_date),
+        'workouts': workouts,
+        'vo2_max': get_vo2_max(garmin_client, actual_date),
+        'body_battery': get_body_battery(garmin_client, actual_date),
+        'stress': get_stress_data(garmin_client, actual_date),
+        'hrv': get_hrv_data(garmin_client, actual_date),
+        'fitness_age': get_fitness_age(garmin_client, actual_date),
+        'respiration': get_respiration_data(garmin_client, actual_date),
         'lactate_threshold': get_lactate_threshold(garmin_client),
     }
 
