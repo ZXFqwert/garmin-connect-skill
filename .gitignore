@@ -1,0 +1,29 @@
+# Python虚拟环境
+sticker-gen/venv/
+venv/
+__pycache__/
+*.pyc
+
+# 其他项目目录
+tavily-research/
+commodity-monitor/
+material_price_monitor/
+garmin-connect-skill/
+
+# 工作区文件
+memory/
+.learnings/
+.openclaw/
+*.md
+!.gitignore
+!README.md
+
+# 其他文件
+*.skill
+*.zip
+*.bas
+*.txt
+!requirements.txt
+create_test_data.py
+test_garmin_auth.py
+xiaodaka_sales_monitor.md
