@@ -1,246 +1,351 @@
 #!/usr/bin/env python3
-"""健康简报 - 通过OpenClaw发送"""
+"""
+健康简报增强版 - 支持新的23个字段
+新增：目标完成度、压力百分比、身体电量、时间范围等
+"""
 
 import json
 import sys
-from datetime import datetime, time
+import sqlite3
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
-# 标记需要通过OpenClaw发送
 ALERT_FILE = Path.home() / ".clawdbot" / "feishu_health_alert.json"
+DB_PATH = Path.home() / ".clawdbot" / "garmin" / "data.db"
 
-def load_garmin_data():
-    """加载Garmin数据 - 从数据库读取（更准确）"""
-    import sqlite3
-    from datetime import datetime, timedelta
 
-    db_path = Path.home() / ".clawdbot" / "garmin" / "data.db"
-    if not db_path.exists():
+def load_complete_data():
+    """加载完整数据（包含新增的23个字段）"""
+    if not DB_PATH.exists():
         return None
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
-        # 获取今天的数据（如果步数很少，用昨天的）
-        beijing_tz = timedelta(hours=8)
+        # 获取今天的数据
         now = datetime.now()
+        beijing_tz = timedelta(hours=8)
 
         # 判断今天还是昨天
         hour = now.hour
         if hour < 5:
-            # 凌晨0-5点，用昨天的数据
             target_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         else:
             target_date = now.strftime("%Y-%m-%d")
 
-        # 查询数据
-        cursor.execute("""
-            SELECT date, steps, calories, active_seconds,
-                   heart_rate_resting, heart_rate_min, heart_rate_max
-            FROM daily_metrics
-            WHERE date = ?
-        """, (target_date,))
-
+        # 查询所有字段（81个）
+        cursor.execute("SELECT * FROM daily_metrics WHERE date = ?", (target_date,))
         row = cursor.fetchone()
+
         if not row:
             return None
 
-        date, steps, calories, active, hr_resting, hr_min, hr_max = row
+        # 获取列名
+        cursor.execute("PRAGMA table_info(daily_metrics)")
+        columns = [desc[1] for desc in cursor.fetchall()]
 
-        # 如果今天步数很少（<1000），尝试获取昨天的
-        if steps < 1000:
-            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-            cursor.execute("""
-                SELECT date, steps, calories, active_seconds,
-                       heart_rate_resting, heart_rate_min, heart_rate_max
-                FROM daily_metrics
-                WHERE date = ?
-            """, (yesterday,))
-            row2 = cursor.fetchone()
-            if row2 and row2[1] > steps * 2:
-                date, steps, calories, active, hr_resting, hr_min, hr_max = row2
+        data = dict(zip(columns, row))
 
         # 获取睡眠数据
         cursor.execute("""
-            SELECT duration_hours, quality_percent
-            FROM sleep_data
+            SELECT * FROM sleep_data
             WHERE date = ? OR date = ?
-            ORDER BY date DESC
-            LIMIT 1
-        """, (date, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
+            ORDER BY date DESC LIMIT 1
+        """, (target_date, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
         sleep_row = cursor.fetchone()
 
-        sleep = {}
+        sleep_data = {}
         if sleep_row:
-            sleep = {
-                'duration_hours': sleep_row[0] or 0,
-                'quality_percent': sleep_row[1] or 0
-            }
+            sleep_columns = [desc[1] for desc in cursor.description]
+            sleep_data = dict(zip(sleep_columns, sleep_row))
 
-        # 获取运动数据
+        # 获取今日运动
         cursor.execute("""
-            SELECT sport_name, duration_minutes, calories
-            FROM workouts
-            WHERE date = ?
-            ORDER BY start_time DESC
-        """, (date,))
+            SELECT * FROM workouts
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (int(now.timestamp() - 86400),))
         workout_rows = cursor.fetchall()
 
         workouts = []
-        for wr in workout_rows:
-            workouts.append({
-                'name': wr[0],
-                'duration_minutes': wr[1] or 0,
-                'calories': wr[2] or 0
-            })
+        if workout_rows:
+            workout_columns = [desc[1] for desc in cursor.description]
+            for wr in workout_rows:
+                workouts.append(dict(zip(workout_columns, wr)))
 
         conn.close()
 
-        # 组装数据（兼容旧格式）
         return {
-            'date': date,
-            'summary': {
-                'steps': steps or 0,
-                'calories': calories or 0,
-                'heart_rate_resting': hr_resting or 0,
-                'active_seconds': active or 0
-            },
-            'sleep': sleep,
+            'daily': data,
+            'sleep': sleep_data,
             'workouts': workouts
         }
 
     except Exception as e:
-        print(f"❌ 从数据库加载数据失败: {e}", file=sys.stderr)
+        print(f"❌ 加载数据失败: {e}", file=sys.stderr)
         return None
 
-def generate_morning_report(data):
-    """早8点简报"""
+
+def generate_morning_report_enhanced(data):
+    """早报增强版"""
     if not data:
         return None
 
+    daily = data.get('daily', {})
+    sleep = data.get('sleep', {})
+
     lines = []
     lines.append("🌅 早安健康简报")
-    lines.append(f"📅 {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
+    lines.append(f"📅 {daily.get('date', datetime.now().strftime('%Y-%m-%d'))}")
     lines.append("")
 
-    sleep = data.get('sleep', {})
+    # 睡眠部分（增强）
     if sleep.get('duration_hours', 0) > 0:
         lines.append("😴 昨晚睡眠")
-        lines.append(f"  • 时长：{sleep['duration_hours']} 小时")
-        lines.append(f"  • 质量：{sleep['quality_percent']} 分")
-        if sleep['quality_percent'] >= 80:
-            lines.append("  • 评价：✅ 睡眠质量很好")
-        elif sleep['quality_percent'] >= 60:
-            lines.append("  • 评价：🟡 睡眠质量一般")
+        duration = sleep['duration_hours']
+        score = sleep.get('sleep_score', 0)
+        deep = sleep.get('deep_sleep_hours', 0)
+        rem = sleep.get('rem_sleep_hours', 0)
+        light = sleep.get('light_sleep_hours', 0)
+
+        lines.append(f"  • 时长：{duration:.1f}小时")
+        lines.append(f"  • 评分：{score}分")
+
+        if deep or rem or light:
+            total = deep + rem + light
+            if total > 0:
+                lines.append(f"  • 结构：深睡{deep/total*100:.0f}% | REM{rem/total*100:.0f}% | 浅睡{light/total*100:.0f}%")
+
+        # 评价
+        if duration >= 7 and score >= 70:
+            lines.append("  • 评价：✅ 睡眠充足且质量好")
+        elif duration >= 6:
+            lines.append("  • 评价：🟡 时长尚可，可再早睡")
         else:
-            lines.append("  • 评价：⚠️ 睡眠质量需改善")
-    else:
-        lines.append("😴 睡眠数据：暂无昨晚数据")
+            lines.append("  • 评价：⚠️ 睡眠不足，今晚补回来")
 
     lines.append("")
     lines.append("📊 今日初始状态")
-    summary = data.get('summary', {})
-    lines.append(f"  • 静息心率：{summary['heart_rate_resting']} bpm")
-    lines.append(f"  • 昨日步数：{summary['steps']:,} 步")
+
+    # 身体电量（新增）
+    bb = daily.get('body_battery_current', 0)
+    bb_highest = daily.get('body_battery_highest', 0)
+    bb_lowest = daily.get('body_battery_lowest', 0)
+
+    lines.append(f"  • 身体电量：{bb}（最高{bb_highest}，最低{bb_lowest}）")
+    if bb >= 70:
+        lines.append("    状态：✅ 精力充沛")
+    elif bb >= 40:
+        lines.append("    状态：🟡 正常水平")
+    else:
+        lines.append("    状态：⚠️ 电量不足，注意休息")
+
+    # 心率
+    hr_resting = daily.get('heart_rate_resting', 0)
+    hr_min = daily.get('heart_rate_min', 0)
+    hr_max = daily.get('heart_rate_max', 0)
+    lines.append(f"  • 静息心率：{hr_resting} bpm（范围：{hr_min}-{hr_max}）")
+
+    # 压力（新增）
+    stress_avg = daily.get('stress_average', 0)
+    stress_pct = daily.get('stress_percentage', 0)
+    lines.append(f"  • 平均压力：{stress_avg}（压力时间占比{stress_pct:.1f}%）")
+
+    # 昨日活动
+    steps_yesterday = daily.get('steps', 0)
+    lines.append(f"  • 昨日步数：{steps_yesterday:,}步")
+
+    lines.append("")
+    lines.append("🎯 今日目标")
+
+    # 步数目标（新增）
+    step_goal = daily.get('daily_step_goal', 0)
+    if step_goal > 0:
+        lines.append(f"  • 步数目标：{step_goal:,}步")
+
+    # 运动目标（新增）
+    intensity_goal = daily.get('intensity_minutes_goal', 0)
+    if intensity_goal > 0:
+        lines.append(f"  • 运动目标：{intensity_goal}分钟（中强度+高强度）")
+
+    # 爬楼目标（新增）
+    floors_goal = daily.get('user_floors_goal', 0)
+    if floors_goal > 0:
+        lines.append(f"  • 爬楼目标：{floors_goal}层")
+
     lines.append("")
     lines.append("💡 **今日建议**")
 
-    # 睡眠不达标特别提醒
-    sleep = data.get('sleep', {})
-    if sleep.get('duration_hours', 0) > 0 and sleep['duration_hours'] < 7:
-        lines.append("  ⚠️ **昨晚睡眠不足警告**")
-        lines.append(f"  只睡了{sleep['duration_hours']}小时，低于推荐的7-8小时")
-        lines.append("  睡眠不足会影响：")
-        lines.append("  • 心血管健康")
-        lines.append("  • 免疫力")
-        lines.append("  • 注意力与记忆力")
-        lines.append("")
-        lines.append("  **今天务必要注意：**")
-        lines.append("  • 中午抽空午休20-30分钟")
-        lines.append("  • 今天早点睡（22:00前上床）")
+    # 根据睡眠情况给建议
+    if sleep.get('duration_hours', 0) > 0 and sleep['duration_hours'] < 6:
+        lines.append("  🚨 **昨晚睡眠不足，优先补觉**")
+        lines.append("  • 中午午休20-30分钟")
+        lines.append("  • 今晚22:00前上床，23:00前入睡")
         lines.append("  • 避免剧烈运动，以恢复为主")
-        lines.append("  • 少喝咖啡，多喝水")
-        lines.append("")
-        lines.append("  长期睡眠不足会增加疾病风险，请重视！")
-    elif sleep.get('quality_percent', 0) < 60 and sleep.get('duration_hours', 0) > 0:
-        lines.append("  • 睡眠质量一般，今天注意休息")
-    elif summary['steps'] < 8000:
-        lines.append("  • 昨天运动量较少，今天多活动")
+    elif bb < 40:
+        lines.append("  ⚠️ **身体电量较低**")
+        lines.append("  • 注意休息，避免过度劳累")
+        lines.append("  • 可以小憩20分钟恢复")
+    elif steps_yesterday < 5000:
+        lines.append("  • 昨天运动量少，今天多走走")
+        lines.append("  • 目标10,000步或30分钟运动")
+    else:
+        lines.append("  • 保持规律作息")
+        lines.append("  • 饮食均衡，充足饮水")
 
-    lines.append("  • 保持充足饮水（2-3L）")
-    lines.append("  • 注意工作间隙休息")
     lines.append("")
     lines.append("🦞 祝你今天精力充沛！")
 
     return "\n".join(lines)
 
-def generate_evening_report(data):
-    """晚10点简报"""
+
+def generate_evening_report_enhanced(data):
+    """晚报增强版"""
     if not data:
         return None
 
+    daily = data.get('daily', {})
+    workouts = data.get('workouts', [])
+
     lines = []
     lines.append("🌙 晚安健康简报")
-    lines.append(f"📅 {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
+    lines.append(f"📅 {daily.get('date', datetime.now().strftime('%Y-%m-%d'))}")
     lines.append("")
 
-    summary = data.get('summary', {})
     lines.append("📊 今日活动总结")
-    lines.append(f"  • 步数：{summary['steps']:,} 步")
 
-    if summary['steps'] >= 10000:
-        lines.append("  • 步数评价：✅ 优秀！达标")
-    elif summary['steps'] >= 8000:
-        lines.append("  • 步数评价：🟡 良好，继续保持")
+    # 步数与目标（增强）
+    steps = daily.get('steps', 0)
+    step_goal = daily.get('daily_step_goal', 0)
+
+    if step_goal > 0:
+        pct = steps / step_goal * 100
+        lines.append(f"  • 步数：{steps:,} / {step_goal:,}（{pct:.1f}%）")
+        if pct >= 100:
+            lines.append("    ✅ 目标达成！")
+        elif pct >= 80:
+            lines.append("    🟡 接近目标")
+        else:
+            lines.append(f"    🟠 差{step_goal - steps:,}步")
     else:
-        lines.append("  • 步数评价：🟠 一般，明天多走")
+        lines.append(f"  • 步数：{steps:,}")
 
-    lines.append(f"  • 消耗卡路里：{summary['calories']:.0f} 卡")
-    lines.append(f"  • 静息心率：{summary['heart_rate_resting']} bpm")
+    # 运动目标完成度（新增）
+    moderate = daily.get('moderate_intensity_minutes', 0)
+    vigorous = daily.get('vigorous_intensity_minutes', 0)
+    total_intensity = moderate + vigorous
+    intensity_goal = daily.get('intensity_minutes_goal', 0)
+
+    if intensity_goal > 0:
+        pct = total_intensity / intensity_goal * 100 if intensity_goal > 0 else 0
+        lines.append(f"  • 运动：{total_intensity} / {intensity_goal}分钟（{pct:.1f}%）")
+        lines.append(f"    （中强度{modest}分钟 + 高强度{vigorous}分钟）")
+
+    # 爬楼目标（新增）
+    floors = daily.get('floors_ascended', 0)
+    floors_goal = daily.get('user_floors_goal', 0)
+
+    if floors_goal > 0 and floors > 0:
+        pct = floors / floors_goal * 100
+        lines.append(f"  • 爬楼：{floors:.0f} / {floors_goal}层（{pct:.1f}%）")
+
+    # 卡路里
+    calories = daily.get('calories', 0)
+    calories_active = daily.get('calories_active', 0)
+    lines.append(f"  • 卡路里：{calories:,}（活动消耗{calories_active}）")
+
     lines.append("")
 
-    workouts = data.get('workouts', [])
+    # 身体电量总结（新增）
+    bb = daily.get('body_battery_current', 0)
+    bb_charged = daily.get('body_battery_charged', 0)
+    bb_drained = daily.get('body_battery_drained', 0)
+
+    lines.append("🔋 身体电量")
+    lines.append(f"  • 当前：{bb}")
+    lines.append(f"  • 充电：{bb_charged}")
+    lines.append(f"  • 消耗：{bb_drained}")
+
+    # 压力分析（新增）
+    stress_pct = daily.get('stress_percentage', 0)
+    low_pct = daily.get('low_stress_percentage', 0)
+    rest_pct = daily.get('rest_stress_percentage', 0)
+
+    lines.append("")
+    lines.append("😰 压力分析")
+    lines.append(f"  • 总压力时间占比：{stress_pct:.1f}%")
+    lines.append(f"  • 低压状态：{low_pct:.1f}%")
+    lines.append(f"  • 休息状态：{rest_pct:.1f}%")
+
+    if stress_pct > 20:
+        lines.append("  • 评价：⚠️ 压力较大，注意放松")
+    else:
+        lines.append("  • 评价：✅ 压力正常")
+
+    lines.append("")
+
+    # 运动记录
     if workouts:
-        lines.append(f"🏋️ 今日运动 ({len(workouts)}次)")
-        for workout in workouts[:5]:
-            name = workout.get('name', 'Unnamed')
-            duration = workout.get('duration_minutes', 0)
-            calories = workout.get('calories', 0)
+        lines.append(f"🏋️ 今日运动（{len(workouts)}次）")
+        for wo in workouts[:5]:
+            name = wo.get('name', wo.get('type', 'Unknown'))
+            duration = wo.get('duration_minutes', 0)
+            calories = wo.get('calories', 0)
             lines.append(f"  • {name} - {duration}分钟, {calories}卡")
         lines.append("")
 
     lines.append("💡 明日建议")
-    if summary['steps'] < 8000:
-        lines.append("  • 今天运动量不足，明天目标10,000步")
+
+    # 根据今日情况给建议
+    if steps < step_goal * 0.5:
+        lines.append(f"  • 步数未达标，明天目标{step_goal:,}步")
+    elif total_intensity < intensity_goal * 0.5 and intensity_goal > 0:
+        lines.append(f"  • 运动不足，明天目标{intensity_goal}分钟")
     else:
         lines.append("  • 保持运动习惯，继续加油")
-    lines.append("  • 早点休息，保证7-8小时睡眠")
+
+    # 睡眠建议
+    if bb < 30:
+        lines.append("  • 身体电量低，今晚务必早睡")
+        lines.append("  • 目标：22:30上床，23:00入睡")
+    else:
+        lines.append("  • 早点休息，保证7-8小时睡眠")
+
+    lines.append("")
+    lines.append("⏰ 数据采集时间")
+    start_time = daily.get('wellness_start_time_local', '')
+    end_time = daily.get('wellness_end_time_local', '')
+    if start_time and end_time:
+        lines.append(f"  • {start_time} → {end_time}")
+
     lines.append("")
     lines.append("🦞 晚安，好梦！")
 
     return "\n".join(lines)
 
-def save_alert(message):
-    """保存消息到alert文件，OpenClaw会读取并发送"""
+
+def save_alert(message, report_type):
+    """保存到alert文件"""
     ALERT_FILE.parent.mkdir(exist_ok=True)
 
     alert = {
         "timestamp": datetime.now().isoformat(),
-        "type": "health_report",
+        "type": f"health_report_{report_type}",
         "message": message
     }
 
-    with open(ALERT_FILE, 'w') as f:
+    with open(ALERT_FILE, 'w', encoding='utf-8') as f:
         json.dump(alert, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ 健康简报已保存: {ALERT_FILE}")
+    print(f"✅ {report_type}已保存: {ALERT_FILE}")
+
 
 def main():
     """主函数"""
-    data = load_garmin_data()
+    data = load_complete_data()
     if not data:
-        print("❌ 无法加载Garmin数据")
+        print("❌ 无法加载数据")
         sys.exit(1)
 
     now = datetime.now()
@@ -251,24 +356,23 @@ def main():
 
     # 早报：6:00-12:00
     if time(6, 0) <= current_time < time(12, 0):
-        report = generate_morning_report(data)
+        report = generate_morning_report_enhanced(data)
         report_type = "早报"
     # 晚报：18:00-23:59
     elif time(18, 0) <= current_time:
-        report = generate_evening_report(data)
+        report = generate_evening_report_enhanced(data)
         report_type = "晚报"
 
     if report:
-        print(f"📊 {report_type}已生成")
-        print("=" * 50)
+        print(f"📊 {report_type}已生成（增强版）")
+        print("=" * 60)
         print(report)
-        print("=" * 50)
+        print("=" * 60)
 
-        # 保存到alert文件
-        save_alert(report)
-        print(f"✅ {report_type}将通过OpenClaw发送到飞书")
+        save_alert(report, report_type)
     else:
         print(f"⏰ 当前时间 {now.strftime('%H:%M')} 不在发送时段")
+
 
 if __name__ == "__main__":
     main()
